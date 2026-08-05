@@ -4,6 +4,7 @@
 import gc
 import time
 from contextlib import contextmanager
+from copy import copy
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -14,13 +15,15 @@ from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.distributed.afd_transfer.afd_connector.factory import (
     AFDConnectorFactory)
 from vllm.distributed.parallel_state import get_world_group
-from vllm.forward_context import AFDMetadata
+from vllm.forward_context import (AFDMetadata, get_forward_context,
+                                  override_forward_context)
 from vllm.logger import logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu_ffn_model_runner import GPUFFNModelRunner
 import vllm.envs as envs
 
+from vllm_ascend.afd_ubatch_utils import get_afd_num_ubatches
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.worker.model_runner_v1 import (
     NPUModelRunner, _replace_gpu_model_runner_function_wrapper,
@@ -83,9 +86,8 @@ class NPUFFNModelRunner(NPUModelRunner, GPUFFNModelRunner):
         self.ffn_size = self.connector.ffn_size
 
         self.ffn_multistream_capable = self.afd_config.is_ffn_multistream
-        num_ubatches_cfg = self.parallel_config.num_ubatches if self.parallel_config.num_ubatches else 1
+        self.afd_num_ubatches = get_afd_num_ubatches(self.vllm_config)
         self.ffn_comm_stream = torch.npu.Stream() if self.ffn_multistream_capable else None
-        self.ffn_comm_events = [torch.npu.Event() for _ in range(num_ubatches_cfg)] if self.ffn_multistream_capable else []
         logger.info("attn_size = %s, ffn_size = %s", self.attn_size,
                     self.ffn_size)
         if getattr(self.model_config.hf_config, "text_config",
@@ -94,6 +96,22 @@ class NPUFFNModelRunner(NPUModelRunner, GPUFFNModelRunner):
                 self.model_config.hf_config.text_config.num_hidden_layers)
         else:
             self.num_layers = self.model_config.hf_config.num_hidden_layers
+        if self.afd_num_ubatches > 1:
+            self.ffn_recv_stream = torch.npu.Stream()
+            self.ffn_compute_stream = torch.npu.Stream()
+            self.ffn_send_stream = torch.npu.Stream()
+            self.ffn_recv_events = [
+                [torch.npu.Event() for _ in range(self.afd_num_ubatches)]
+                for _ in range(self.num_layers)
+            ]
+            self.ffn_compute_events = [
+                [torch.npu.Event() for _ in range(self.afd_num_ubatches)]
+                for _ in range(self.num_layers)
+            ]
+            self.ffn_send_events = [
+                [torch.npu.Event() for _ in range(self.afd_num_ubatches)]
+                for _ in range(self.num_layers)
+            ]
         self.dummy_run_call_cnt = 0
         self.replay_cnt = 0
         self.topk = self.model_config.hf_config.num_experts_per_tok
@@ -397,13 +415,17 @@ class NPUFFNModelRunner(NPUModelRunner, GPUFFNModelRunner):
 
         return recv_output
 
-    def _build_ffn_num_tokens_across_dp(self, dp_metadata_list: dict) -> Optional[torch.Tensor]:
+    def _build_ffn_num_tokens_across_dp(
+        self, dp_metadata_list: dict, stage_idx: int = 0
+    ) -> Optional[torch.Tensor]:
         """Build the num_tokens_across_dp tensor for the FFN side.
 
         For asymmetric A/F scenarios (A > F), multiple A token counts need to
         be merged into the corresponding F.
         """
-        dp_metadata = dp_metadata_list.get(0, None) if dp_metadata_list else None
+        dp_metadata = (
+            dp_metadata_list.get(stage_idx, None) if dp_metadata_list else None
+        )
 
         if dp_metadata is None:
             return None
@@ -437,11 +459,35 @@ class NPUFFNModelRunner(NPUModelRunner, GPUFFNModelRunner):
                      aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
                      dp_metadata_list: dict | None = None):
         """Run FFN computation for graph capture or replay."""
-        # is_ubatch = dp_metadata_list is not None and len(dp_metadata_list) > 1
-        # num_ubatches = self.parallel_config.num_ubatches if is_ubatch else 1
-        num_ubatches = 1
+        stage_indices = sorted(dp_metadata_list) if dp_metadata_list else [0]
+        if stage_indices != list(range(len(stage_indices))):
+            raise RuntimeError(
+                f"AFD stage indices must be contiguous from zero: {stage_indices}"
+            )
+        num_ubatches = len(stage_indices)
+        is_ubatched = num_ubatches > 1
+        configured_num_ubatches = get_afd_num_ubatches(self.vllm_config)
+        if is_ubatched and num_ubatches != configured_num_ubatches:
+            raise RuntimeError(
+                "Attention/FFN ubatch configuration mismatch: "
+                f"received={num_ubatches}, configured={configured_num_ubatches}"
+            )
+        connector_num_ubatches = getattr(
+            self.connector, "num_ubatches", configured_num_ubatches
+        )
+        if num_ubatches > connector_num_ubatches:
+            raise RuntimeError(
+                "AFD connector has fewer communication groups than stages: "
+                f"groups={connector_num_ubatches}, stages={num_ubatches}"
+            )
+        if dp_metadata_list is not None:
+            # The FFN service loop receives this metadata before entering the
+            # model runner.  Keep the connector cache in sync before streamed
+            # A2F receives use it to preallocate fixed-shape tensor buffers.
+            self.connector.update_state_from_dp_metadata(
+                dp_metadata_list, is_graph_capturing=False
+            )
         rank_ffn_output = None
-        ffn_multistream_enable = self.ffn_multistream_capable and num_ubatches > 1
         afd_metadata = AFDMetadata(
             afd_tokens_start_loc=[],
             afd_reqs_start_loc=[],
@@ -450,8 +496,51 @@ class NPUFFNModelRunner(NPUModelRunner, GPUFFNModelRunner):
             afd_tokens_lens=[],
             num_of_stages=num_ubatches
         )
-        num_tokens_across_dp = self._build_ffn_num_tokens_across_dp(dp_metadata_list)
-        ffn_event_recorded = [False] * num_ubatches
+        num_tokens_across_dp = self._build_ffn_num_tokens_across_dp(
+            dp_metadata_list, stage_idx=0
+        )
+
+        # Build a complete Ascend forward context for every AFD stage.  Merely
+        # updating ForwardContext.num_tokens in the inner loop is insufficient:
+        # set_ascend_forward_context also derives padded_num_tokens, mc2_mask,
+        # max_tokens_across_dp and the MoE communication method from the stage
+        # token counts.  Sharing the stage-0 context makes an unequal U3 split
+        # such as [2, 2, 4] feed a 2-element MC2 mask to a 4-token stage.
+        stage_forward_contexts = []
+        for stage_idx in range(num_ubatches):
+            stage_num_tokens_across_dp = self._build_ffn_num_tokens_across_dp(
+                dp_metadata_list, stage_idx=stage_idx
+            )
+            stage_num_tokens = (
+                int(stage_num_tokens_across_dp[
+                    self.parallel_config.data_parallel_rank
+                ].item())
+                if stage_num_tokens_across_dp is not None
+                else 0
+            )
+            stage_afd_metadata = copy(afd_metadata)
+            stage_afd_metadata.afd_stage_idx = stage_idx
+            with set_ascend_forward_context(
+                attn_metadata=None,
+                vllm_config=self.vllm_config,
+                batch_descriptor=None,
+                aclgraph_runtime_mode=aclgraph_runtime_mode,
+                model_instance=self.model,
+                afd_metadata=stage_afd_metadata,
+                afd_comm_stream=self.ffn_comm_stream,
+                num_tokens=stage_num_tokens,
+                num_tokens_across_dp=stage_num_tokens_across_dp,
+            ):
+                stage_forward_context = get_forward_context()
+                stage_forward_context.ubatch_idx = stage_idx
+                stage_forward_context.num_ubatches = num_ubatches
+                # get_mc2_mask() returns a view of one process-global reserve.
+                # Clone it so later stage initialization cannot overwrite this
+                # stage's active bits or shape-dependent contents.
+                stage_mc2_mask = getattr(stage_forward_context, "mc2_mask", None)
+                if stage_mc2_mask is not None:
+                    stage_forward_context.mc2_mask = stage_mc2_mask.clone()
+                stage_forward_contexts.append(stage_forward_context)
 
         with set_ascend_forward_context(
                     attn_metadata=None,
@@ -464,17 +553,58 @@ class NPUFFNModelRunner(NPUModelRunner, GPUFFNModelRunner):
                     num_tokens=num_tokens_across_dp[self.parallel_config.data_parallel_rank].item() if num_tokens_across_dp is not None else 0,
                     num_tokens_across_dp=num_tokens_across_dp):
             for layer_idx in range(0, self.num_layers):
-                layer_multistream = ffn_multistream_enable and (layer_idx > 0)
                 for ubatch_idx in range(num_ubatches):
-                    if ffn_multistream_enable and ffn_event_recorded[ubatch_idx]:
-                        self.ffn_comm_events[ubatch_idx].wait(torch.npu.current_stream())
+                    if is_ubatched:
+                        stage_num_tokens_across_dp = (
+                            self._build_ffn_num_tokens_across_dp(
+                                dp_metadata_list, stage_idx=ubatch_idx
+                            )
+                        )
+                        forward_context = get_forward_context()
+                        forward_context.ubatch_idx = ubatch_idx
+                        forward_context.dp_metadata = dp_metadata_list.get(
+                            ubatch_idx
+                        )
+                        forward_context.num_tokens_across_dp = (
+                            stage_num_tokens_across_dp
+                        )
+                        forward_context.num_tokens = (
+                            int(
+                                stage_num_tokens_across_dp[
+                                    self.parallel_config.data_parallel_rank
+                                ].item()
+                            )
+                            if stage_num_tokens_across_dp is not None
+                            else 0
+                        )
+                        forward_context.afd_metadata.afd_stage_idx = ubatch_idx
                     # ffn 接收
                     afd_connector_data = self.connector.create_recv_metadata(
                         dp_metadata_list=dp_metadata_list,
                         ubatch_idx=ubatch_idx,
                         layer_idx=layer_idx,
                         max_num_tokens=self.max_num_tokens)
-                    recv_output = self.connector.recv_attn_output(metadata=afd_connector_data, ubatch_idx=ubatch_idx)
+                    if is_ubatched:
+                        previous_send_event = (
+                            self.ffn_send_events[layer_idx - 1][ubatch_idx]
+                            if layer_idx > 0
+                            else None
+                        )
+                        recv_event = self.ffn_recv_events[layer_idx][ubatch_idx]
+                        recv_output, recv_event = (
+                            self.connector.recv_attn_output_streamed(
+                                ubatch_idx=ubatch_idx,
+                                recv_stream=self.ffn_recv_stream,
+                                wait_event=previous_send_event,
+                                done_event=recv_event,
+                                metadata=afd_connector_data,
+                            )
+                        )
+                    else:
+                        recv_output = self.connector.recv_attn_output(
+                            metadata=afd_connector_data,
+                            ubatch_idx=ubatch_idx,
+                        )
                     if hasattr(self.connector, "update_metadata") and afd_connector_data is not None:
                         self.connector.update_metadata(afd_connector_data, recv_output)
 
@@ -487,34 +617,75 @@ class NPUFFNModelRunner(NPUModelRunner, GPUFFNModelRunner):
                     router_logits = recv_output.router_logits
                     row_idx = recv_output.row_idx
                     x_active_mask = recv_output.x_active_mask
-                    rank_ffn_output = self._run_ffn_computation(
-                        hidden_states=hidden_states,
-                        layer_idx=layer_idx,
-                        group_list=group_list,
-                        dynamic_scales=dynamic_scales if self.connector.quant_mode == 1 else None,
-                        topk_weights=topk_weights,
-                        topk_ids=topk_ids,
-                        router_logits=router_logits,
-                        row_idx=row_idx,
-                        x_active_mask=x_active_mask,
-                        cam_p2p_ep_name=recv_output.cam_p2p_ep_name or ""
-                    )
+                    # NPUP2P recv_attn_output stores the layer input_ids on
+                    # the currently active (outer) context.  Propagate that
+                    # runtime field before switching to the per-stage context;
+                    # otherwise expert selection dereferences None here.
+                    stage_forward_context = stage_forward_contexts[ubatch_idx]
+                    stage_forward_context.input_ids = get_forward_context().input_ids
+                    with override_forward_context(
+                        stage_forward_context
+                    ):
+                        if is_ubatched:
+                            compute_event = self.ffn_compute_events[
+                                layer_idx
+                            ][ubatch_idx]
+                            with torch.npu.stream(self.ffn_compute_stream):
+                                recv_event.wait(self.ffn_compute_stream)
+                                hidden_states.record_stream(
+                                    self.ffn_compute_stream
+                                )
+                                stage_forward_context.input_ids.record_stream(
+                                    self.ffn_compute_stream
+                                )
+                                rank_ffn_output = self._run_ffn_computation(
+                                    hidden_states=hidden_states,
+                                    layer_idx=layer_idx,
+                                    group_list=group_list,
+                                    dynamic_scales=dynamic_scales if self.connector.quant_mode == 1 else None,
+                                    topk_weights=topk_weights,
+                                    topk_ids=topk_ids,
+                                    router_logits=router_logits,
+                                    row_idx=row_idx,
+                                    x_active_mask=x_active_mask,
+                                    cam_p2p_ep_name=recv_output.cam_p2p_ep_name or ""
+                                )
+                                compute_event.record(self.ffn_compute_stream)
+                        else:
+                            rank_ffn_output = self._run_ffn_computation(
+                                hidden_states=hidden_states,
+                                layer_idx=layer_idx,
+                                group_list=group_list,
+                                dynamic_scales=dynamic_scales if self.connector.quant_mode == 1 else None,
+                                topk_weights=topk_weights,
+                                topk_ids=topk_ids,
+                                router_logits=router_logits,
+                                row_idx=row_idx,
+                                x_active_mask=x_active_mask,
+                                cam_p2p_ep_name=recv_output.cam_p2p_ep_name or ""
+                            )
 
                     # ffn发送
-                    self.connector.send_ffn_output(
-                        rank_ffn_output, afd_connector_data,
-                        ubatch_idx=ubatch_idx,
-                        multistream_enable=layer_multistream,
-                        comm_stream=self.ffn_comm_stream if layer_multistream else None,
-                        comm_event=self.ffn_comm_events[ubatch_idx] if layer_multistream else None)
-                    if layer_multistream:
-                        ffn_event_recorded[ubatch_idx] = True
+                    if is_ubatched:
+                        send_event = self.ffn_send_events[layer_idx][ubatch_idx]
+                        self.connector.send_ffn_output_streamed(
+                            hidden_states=rank_ffn_output,
+                            ubatch_idx=ubatch_idx,
+                            send_stream=self.ffn_send_stream,
+                            wait_event=compute_event,
+                            done_event=send_event,
+                        )
+                    else:
+                        self.connector.send_ffn_output(
+                            rank_ffn_output,
+                            afd_connector_data,
+                            ubatch_idx=ubatch_idx,
+                        )
 
-            if ffn_multistream_enable:
-                curr_stream = torch.npu.current_stream()
-                for i, ev in enumerate(self.ffn_comm_events):
-                    if ffn_event_recorded[i]:
-                        ev.wait(curr_stream)
+            if is_ubatched:
+                current_stream = torch.npu.current_stream()
+                for ubatch_idx in range(num_ubatches):
+                    self.ffn_send_events[-1][ubatch_idx].wait(current_stream)
         return rank_ffn_output
 
     def _run_ffn_computation(self,

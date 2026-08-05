@@ -56,6 +56,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.afd_ubatch_utils import get_afd_num_ubatches
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
@@ -457,10 +458,8 @@ class NPUWorker(WorkerBase):
         # for more details
         self.device = self._init_device()
         # Initialize workspace manager.
-        # Use the configured num_ubatches so that AFD ubatching can allocate
-        # per-ubatch workspace buffers. Defaults to 1 when ubatching is off.
-        num_ubatches = max(
-            1, getattr(self.vllm_config.parallel_config, "num_ubatches", 1))
+        # AFD owns its microbatch count independently of upstream DBO.
+        num_ubatches = get_afd_num_ubatches(self.vllm_config)
         init_workspace_manager(self.device, num_ubatches)
         # Init ModelRunner here, so that we have access to self.device.
         if (
@@ -964,6 +963,39 @@ class NPUWorker(WorkerBase):
             ):
                 self.model_runner._init_kv_zero_meta()
 
+    def _relay_profile_control_to_afd_ffn(
+        self,
+        is_start: bool,
+        profile_prefix: str | None,
+    ) -> None:
+        vllm_config = getattr(self, "vllm_config", None)
+        afd_config = getattr(vllm_config, "afd_config", None)
+        if afd_config is None or not afd_config.is_attention_server:
+            return
+
+        connector = getattr(self.model_runner, "afd_connector", None)
+        if connector is None:
+            raise RuntimeError(
+                "Attention profiler cannot reach FFN because the AFD "
+                "connector is not initialized"
+            )
+        if not hasattr(connector, "send_profile_control"):
+            raise RuntimeError(
+                "The configured AFD connector does not support FFN profiler "
+                "control"
+            )
+        if not connector.is_attn_top_min_size_rank(connector.rank):
+            return
+
+        logger.info(
+            "Relaying profiler %s to paired AFD FFN rank(s)",
+            "start" if is_start else "stop",
+        )
+        connector.send_profile_control(
+            is_start=is_start,
+            profile_prefix=profile_prefix,
+        )
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled (RFC #6954 - align with upstream vLLM)
         if self.profiler_config is None or self.profiler_config.profiler is None:
@@ -980,19 +1012,44 @@ class NPUWorker(WorkerBase):
             rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
             trace_name = f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
 
-            if self.profiler is None:
-                self.profiler = TorchNPUProfilerWrapper(self.profiler_config, trace_name)
-                logger.debug("Starting torch profiler with trace name: %s", trace_name)
-                self.profiler.start()  # type: ignore[attr-defined]
-            else:
-                # Profiler already initialized. Restart profiling but keep
-                # the original trace name from the first initialization.
-                self.profiler.start()
+            self._relay_profile_control_to_afd_ffn(
+                is_start=True,
+                profile_prefix=profile_prefix,
+            )
+            try:
+                if self.profiler is None:
+                    self.profiler = TorchNPUProfilerWrapper(
+                        self.profiler_config, trace_name
+                    )
+                    logger.debug(
+                        "Starting torch profiler with trace name: %s",
+                        trace_name,
+                    )
+                    self.profiler.start()  # type: ignore[attr-defined]
+                else:
+                    # Profiler already initialized. Restart profiling but keep
+                    # the original trace name from the first initialization.
+                    self.profiler.start()
+            except Exception:
+                # Roll the FFN side back if local profiler initialization fails.
+                self._relay_profile_control_to_afd_ffn(
+                    is_start=False,
+                    profile_prefix=profile_prefix,
+                )
+                raise
         else:
-            if self.profiler is None:
-                logger.warning("Profiler was not started, nothing to stop.")
-                return
-            self.profiler.stop()
+            try:
+                if self.profiler is None:
+                    logger.warning("Profiler was not started, nothing to stop.")
+                else:
+                    self.profiler.stop()
+            finally:
+                # The FFN acknowledgement is sent after its trace export, so
+                # profile-stop does not return with an empty FFN directory.
+                self._relay_profile_control_to_afd_ffn(
+                    is_start=False,
+                    profile_prefix=profile_prefix,
+                )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
@@ -1113,16 +1170,46 @@ class NPUWorker(WorkerBase):
         def ffn_worker_loop():
             torch.npu.set_device(self.device)
             logger.info("FFN worker loop started")
+            connector = self.model_runner.connector
             try:
                 while not self._ffn_shutdown_event.is_set():
                     # self.model_runner.prof.step()
                     # 接收dp_metadata_list
+                    message_type, payload = connector.recv_afd_message()
+                    if message_type == "profile_control":
+                        is_start, profile_prefix = payload
+                        logger.info(
+                            "Applying relayed AFD profiler %s",
+                            "start" if is_start else "stop",
+                        )
+                        try:
+                            self.profile(
+                                is_start=is_start,
+                                profile_prefix=profile_prefix,
+                            )
+                        except Exception as exc:
+                            connector.send_profile_control_ack(
+                                is_start=is_start,
+                                success=False,
+                                error=f"{type(exc).__name__}: {exc}",
+                            )
+                            raise
+                        else:
+                            connector.send_profile_control_ack(
+                                is_start=is_start,
+                                success=True,
+                            )
+                        continue
+                    if message_type != "dp_metadata":
+                        raise RuntimeError(
+                            f"Unsupported AFD message: {message_type}"
+                        )
                     (
                         dp_metadata_list,
                         is_attn_graph_capturing,
                         is_warmup,
                         cudagraph_mode,
-                    ) = self.model_runner.connector.recv_dp_metadata_list()
+                    ) = payload
                     logger.info(f"jcz dp_metadata_list:{dp_metadata_list} is_attn_graph_capturing:{is_attn_graph_capturing} is_warmup:{is_warmup} cudagraph_mode:{cudagraph_mode}")
                     # if is_attn_graph_capturing or (is_warmup and not self.model_config.enforce_eager):
                     if is_warmup and not self.model_config.enforce_eager:
@@ -1140,8 +1227,6 @@ class NPUWorker(WorkerBase):
                             dp_metadata_list=dp_metadata_list,
                             cudagraph_mode=cudagraph_mode,
                         )
-
-                    torch.npu.synchronize()
             except Exception as e:
                 logger.error("FFN worker loop error: %s", e)
                 raise

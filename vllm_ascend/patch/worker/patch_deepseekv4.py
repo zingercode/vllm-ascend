@@ -24,6 +24,7 @@ connector (``NPUP2PAFDConnector``).
 
 import typing
 from collections.abc import Callable, Iterable
+from copy import copy
 from itertools import islice
 from typing import Any, Optional
 
@@ -38,7 +39,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -446,21 +447,131 @@ def forward_m2n(
       3. send the attention output + input_ids to the FFN worker.
     After the loop, the final FFN output is received.
     """
+    forward_context = get_forward_context()
+    afd_connector = afd_metadata.afd_connector
+    ubatch_slices = getattr(forward_context, "ubatch_slices", None)
+    if ubatch_slices is None:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if layer.layer_idx > 0:
+                hidden_states = torch.ops.vllm.afd_p2p_recv_ffn_output(
+                    hidden_states
+                )
+            hidden_states = layer.compute_attn_output(
+                positions, hidden_states, residual, llama_4_scaling
+            )
+            p2p_input_ids = getattr(get_forward_context(), "input_ids", None)
+            hidden_states = torch.ops.vllm.afd_p2p_send_attn_output(
+                hidden_states, p2p_input_ids
+            )
+        hidden_states = torch.ops.vllm.afd_p2p_recv_ffn_output(hidden_states)
+        return hidden_states, residual
+
+    num_ubatches = getattr(afd_connector, "num_ubatches", 1)
+    if num_ubatches != 3 or len(ubatch_slices) != num_ubatches:
+        raise RuntimeError(
+            "AFD stream pipeline requires exactly three micro-batches: "
+            f"connector={num_ubatches}, slices={len(ubatch_slices)}"
+        )
+    if not isinstance(forward_context.attn_metadata, list):
+        raise RuntimeError("AFD UBatch3 requires per-ubatch attention metadata")
+    if len(forward_context.attn_metadata) != num_ubatches:
+        raise RuntimeError(
+            "AFD attention metadata count does not match UBatch3 slices"
+        )
+
+    input_ids = getattr(forward_context, "input_ids", None)
+    if input_ids is None:
+        raise RuntimeError("AFD UBatch3 requires input_ids in forward context")
+
+    def slice_positions(token_slice: slice) -> torch.Tensor:
+        if positions.ndim == 2:
+            return positions[:, token_slice]
+        return positions[token_slice]
+
+    hidden_ubatches = [
+        hidden_states[ubatch_slice.token_slice]
+        for ubatch_slice in ubatch_slices
+    ]
+    input_id_ubatches = [
+        input_ids[ubatch_slice.token_slice]
+        for ubatch_slice in ubatch_slices
+    ]
+    position_ubatches = [
+        slice_positions(ubatch_slice.token_slice)
+        for ubatch_slice in ubatch_slices
+    ]
+    stage_contexts = []
+    for ubatch_idx, ubatch_slice in enumerate(ubatch_slices):
+        stage_context = copy(forward_context)
+        stage_context.ubatch_idx = ubatch_idx
+        stage_context.num_ubatches = num_ubatches
+        stage_context.num_tokens = ubatch_slice.num_tokens
+        stage_context.attn_metadata = forward_context.attn_metadata[ubatch_idx]
+        stage_context.input_ids = input_id_ubatches[ubatch_idx]
+        stage_dp_metadata = afd_connector.dp_metadata_list.get(ubatch_idx)
+        if stage_dp_metadata is None:
+            raise RuntimeError(
+                f"Missing Attention DP metadata for ubatch {ubatch_idx}"
+            )
+        stage_context.dp_metadata = stage_dp_metadata
+        stage_context.num_tokens_across_dp = (
+            stage_dp_metadata.num_tokens_across_dp_cpu
+        )
+        stage_afd_metadata = copy(afd_metadata)
+        stage_afd_metadata.afd_stage_idx = ubatch_idx
+        stage_afd_metadata.num_of_stages = num_ubatches
+        stage_context.afd_metadata = stage_afd_metadata
+        stage_contexts.append(stage_context)
+
+    compute_stream = torch.npu.current_stream()
+    previous_recv_events: list[Optional[torch.npu.Event]] = [
+        None for _ in range(num_ubatches)
+    ]
     for layer in islice(self.layers, self.start_layer, self.end_layer):
         layer_idx = getattr(layer, "layer_idx", -1)
-        if layer.layer_idx > 0:
-            hidden_states = torch.ops.vllm.afd_p2p_recv_ffn_output(hidden_states)
-        hidden_states = layer.compute_attn_output(
-            positions, hidden_states, residual, llama_4_scaling
-        )
-        p2p_input_ids = getattr(get_forward_context(), "input_ids", None)
+        for ubatch_idx in range(num_ubatches):
+            previous_recv_event = previous_recv_events[ubatch_idx]
+            if previous_recv_event is not None:
+                previous_recv_event.wait(compute_stream)
 
-        hidden_states = torch.ops.vllm.afd_p2p_send_attn_output(
-            hidden_states, p2p_input_ids
-        )
-    hidden_states = torch.ops.vllm.afd_p2p_recv_ffn_output(hidden_states)
+            with override_forward_context(stage_contexts[ubatch_idx]):
+                hidden_ubatches[ubatch_idx].record_stream(compute_stream)
+                attn_output = layer.compute_attn_output(
+                    position_ubatches[ubatch_idx],
+                    hidden_ubatches[ubatch_idx],
+                    residual,
+                    llama_4_scaling,
+                )
+                compute_event, send_event, recv_event = (
+                    afd_connector.get_attention_pipeline_events(
+                        layer_idx, ubatch_idx
+                    )
+                )
+                compute_event.record(compute_stream)
+                afd_connector.send_attn_output_streamed(
+                    hidden_states=attn_output,
+                    input_ids=input_id_ubatches[ubatch_idx],
+                    ubatch_idx=ubatch_idx,
+                    wait_event=compute_event,
+                    done_event=send_event,
+                )
+                ffn_output, recv_event = (
+                    afd_connector.recv_ffn_output_streamed(
+                        hidden_states=attn_output,
+                        ubatch_idx=ubatch_idx,
+                        wait_event=send_event,
+                        done_event=recv_event,
+                    )
+                )
+            hidden_ubatches[ubatch_idx] = ffn_output
+            previous_recv_events[ubatch_idx] = recv_event
 
-    return hidden_states, residual
+    for recv_event in previous_recv_events:
+        if recv_event is not None:
+            recv_event.wait(compute_stream)
+    for hidden_ubatch in hidden_ubatches:
+        hidden_ubatch.record_stream(compute_stream)
+    return torch.cat(hidden_ubatches, dim=0), residual
 
 
 def afd_model_forward(
@@ -509,9 +620,7 @@ def afd_model_forward(
 
     forward_ctx = get_forward_context()
     afd_metadata = forward_ctx.afd_metadata if forward_ctx is not None else None
-    logger.info(f"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     if afd_metadata is not None:
-        logger.info(f"afd_model_forward afd_metadata {afd_metadata}")
         hidden_states, residual = self.forward_m2n(
             hidden_states, residual, positions, afd_metadata, llama_4_scaling
         )
@@ -598,6 +707,33 @@ def model_compute_ffn_output(
     Gate computation is always on the FFN side, so only ``hidden_states``
     is forwarded to ``compute_ffn_output``; routing tensors are not used.
     """
+    # The FFN runner executes in layer-major, ubatch-minor order.  A single
+    # ForwardContext is shared by all FFN stages, while vLLM's MoE custom op
+    # increments ``moe_layer_index`` after every call.  Without resetting the
+    # index, stage 1 of a layer is resolved as the next layer; eventually the
+    # index runs past ``all_moe_layers`` and get_layer_from_name() asserts.
+    #
+    # Resolve the index from the actual layer name instead of assuming that
+    # model layer indices and the MoE registry always have identical offsets.
+    forward_context = get_forward_context()
+    all_moe_layers = forward_context.all_moe_layers
+    if all_moe_layers is not None:
+        experts = self.model.layers[layer_idx].mlp.experts
+        expected_layer_name = getattr(experts, "layer_name", None)
+        if expected_layer_name is None:
+            raise RuntimeError(
+                f"AFD FFN layer {layer_idx} has no MoE layer_name"
+            )
+        try:
+            expected_moe_index = all_moe_layers.index(expected_layer_name)
+        except ValueError as exc:
+            raise RuntimeError(
+                "AFD FFN MoE layer is missing from all_moe_layers: "
+                f"layer_idx={layer_idx}, layer_name={expected_layer_name}, "
+                f"registered={all_moe_layers}"
+            ) from exc
+        forward_context.moe_layer_index = expected_moe_index
+
     hidden_states = self.model.layers[layer_idx].compute_ffn_output(
         layer_idx=layer_idx, hidden_states=hidden_states
     )

@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 from vllm.config import CacheConfig, CUDAGraphMode, ModelConfig, ParallelConfig, ProfilerConfig, VllmConfig
@@ -322,6 +322,40 @@ class TestNPUWorker(TestBase):
 
             worker.profile(is_start=False)
             mock_profiler.stop.assert_called_once()
+
+    def test_profile_relays_control_to_paired_afd_ffn(self):
+        """Attention profiler commands are relayed over the AFD connector."""
+        from vllm_ascend.worker.worker import NPUWorker
+
+        profiler_config = ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir="/path/to/traces",
+        )
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.profiler_config = profiler_config
+            worker.rank = 0
+            worker.profiler = MagicMock()
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.afd_config.is_attention_server = True
+            worker.model_runner = MagicMock()
+            connector = worker.model_runner.afd_connector
+            connector.rank = 8
+            connector.is_attn_top_min_size_rank.return_value = True
+
+            worker.profile(is_start=True, profile_prefix="capture-42")
+            worker.profile(is_start=False, profile_prefix="capture-42")
+
+            assert connector.send_profile_control.call_args_list == [
+                call(
+                    is_start=True,
+                    profile_prefix="capture-42",
+                ),
+                call(
+                    is_start=False,
+                    profile_prefix="capture-42",
+                ),
+            ]
 
     def test_profile_no_profiler_raises_error(self):
         """Test profile method raises exception when profiler is not available"""
