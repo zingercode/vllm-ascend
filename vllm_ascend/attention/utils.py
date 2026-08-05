@@ -558,7 +558,11 @@ def _make_metadata_with_slice(
 
     if len(attn_metadata.actual_seq_lengths_q) > 0:
         actual_seq_lengths_q = list(
-            range(attn_metadata.decode_token_per_req, max_num_tokens + 1, attn_metadata.decode_token_per_req)
+            range(
+                attn_metadata.decode_token_per_req,
+                num_input_tokens + 1,
+                attn_metadata.decode_token_per_req,
+            )
         )
     else:
         actual_seq_lengths_q = []
@@ -605,4 +609,3 @@ def split_attn_metadata(
             _make_metadata_with_slice(ubatch_slice, common_attn_metadata, max_num_tokens))
 
     return results
-
